@@ -8,6 +8,7 @@ Warden Worker 是一个运行在 Cloudflare Workers 上的 Bitwarden 兼容服�
 
 ## 最近更新
 
+- `2026-02-13`：**完成安全审计**，添加安全响应头、创建安全策略文档（`security`）。详见 [SECURITY_AUDIT.md](./SECURITY_AUDIT.md)。
 - `2026-02-13`：首个账号注册完成后，后续注册默认关闭（`feat(accounts)`）。
 - `2026-02-13`：新增设备管理与设备审批流（`/api/auth-requests*`），支持已登录设备审批新设备登录（`feat(device manager)`）。
 - `2026-02-13`：新增/完善 WebAuthn（通行密钥）注册、断言、无主密码登录、PRF 密钥材料上送与存储（`feat(webauthn)` + `fix(security)`）。
@@ -173,6 +174,29 @@ wrangler dev
 ```
 
 本地可用 `.dev.vars` 注入 secrets。
+
+## 安全
+
+本项目经过全面安全审计（2026-02-13），未发现关键安全漏洞。
+
+### 安全特性
+
+- **零知识架构**：客户端加密，服务端仅存储密文
+- **强加密**：AES-256-GCM、PBKDF2-SHA256、P-256 ECDSA
+- **双因素认证**：TOTP、邮箱、WebAuthn/FIDO2
+- **安全响应头**：防止 XSS、点击劫持、MIME 嗅探等攻击
+- **参数化查询**：防止 SQL 注入
+- **恒定时间比较**：防止时序攻击
+
+### 安全文档
+
+- [SECURITY.md](./SECURITY.md) - 安全策略与最佳实践
+- [SECURITY_AUDIT.md](./SECURITY_AUDIT.md) - 详细安全审计报告
+- [SECURITY_AUDIT_SUMMARY.md](./SECURITY_AUDIT_SUMMARY.md) - 审计摘要
+
+### 报告安全问题
+
+如发现安全漏洞，请通过 [GitHub Security Advisories](https://github.com/Lparksi/warden-worker/security/advisories/new) 私下报告，切勿公开。
 
 ## 许可证
 
