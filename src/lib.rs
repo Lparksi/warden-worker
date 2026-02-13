@@ -12,6 +12,7 @@ mod jwt;
 mod models;
 mod notifications;
 mod router;
+mod smtp;
 mod two_factor;
 mod webauthn;
 

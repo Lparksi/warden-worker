@@ -1,18 +1,20 @@
-use axum::{extract::State, Json};
+use axum::{extract::State, http::HeaderMap, Json};
 use chrono::Utc;
 use constant_time_eq::constant_time_eq;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 use wasm_bindgen::JsValue;
-use worker::{query, Env};
+use worker::{query, D1Database, Env};
 
 use crate::{
     auth::Claims,
     db,
     error::AppError,
+    jwt,
     models::user::{KeyData, PreloginResponse, RegisterRequest, User},
+    smtp::SmtpConfig,
     two_factor, webauthn,
 };
 
@@ -49,6 +51,22 @@ pub struct ChangeEmailRequest {
 pub struct VerifyPasswordRequest {
     #[serde(alias = "MasterPasswordHash")]
     pub master_password_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterVerificationRequest {
+    pub email: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterVerificationClaims {
+    sub: String,
+    email: String,
+    name: Option<String>,
+    exp: i64,
+    nbf: i64,
 }
 
 #[worker::send]
@@ -126,29 +144,7 @@ pub async fn register(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
     let normalized_email = payload.email.trim().to_lowercase();
-    let user_count: Option<i64> = db
-        .prepare("SELECT COUNT(1) AS user_count FROM users")
-        .first(Some("user_count"))
-        .await
-        .map_err(|_| AppError::Database)?;
-    let user_count = user_count.unwrap_or(0);
-    if user_count > 0 {
-        return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
-    }
-
-    let allowed_emails = env
-        .secret("ALLOWED_EMAILS")
-        .ok()
-        .and_then(|secret| secret.as_ref().as_string())
-        .unwrap_or_default();
-    if !allowed_emails.trim().is_empty()
-        && allowed_emails
-            .split(",")
-            .map(|email| email.trim().to_lowercase())
-            .all(|email| email != normalized_email)
-    {
-        return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
-    }
+    ensure_signup_allowed(env.as_ref(), &db, &normalized_email).await?;
     let now = Utc::now().to_rfc3339();
     let user = User {
         id: Uuid::new_v4().to_string(),
@@ -267,6 +263,7 @@ pub async fn change_master_password(
 
 #[worker::send]
 pub async fn change_email(
+    headers: HeaderMap,
     claims: Claims,
     State(env): State<Arc<Env>>,
     Json(payload): Json<ChangeEmailRequest>,
@@ -294,6 +291,7 @@ pub async fn change_email(
         .map_err(|_| AppError::Database)?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
     let user: User = serde_json::from_value(user).map_err(|_| AppError::Internal)?;
+    let old_email = user.email.clone();
 
     if !constant_time_eq(
         user.master_password_hash.as_bytes(),
@@ -311,7 +309,7 @@ pub async fn change_email(
         "UPDATE users SET email = ?1, email_verified = ?2, master_password_hash = ?3, key = ?4, kdf_type = ?5, kdf_iterations = ?6, security_stamp = ?7, updated_at = ?8 WHERE id = ?9",
     )
     .bind(&[
-        new_email.into(),
+        new_email.clone().into(),
         false.into(),
         payload.new_master_password_hash.into(),
         payload.user_symmetric_key.into(),
@@ -331,6 +329,26 @@ pub async fn change_email(
         }
     })?;
 
+    let origin = origin_from_headers(&headers);
+    match SmtpConfig::from_env(env.as_ref()) {
+        Ok(Some(smtp)) => {
+            if let Err(err) = smtp
+                .send_change_email_confirmation(&new_email, &old_email, &origin)
+                .await
+            {
+                log::warn!("send change email confirmation failed: {err}");
+            }
+            if let Err(err) = smtp
+                .send_change_email_alert(&old_email, &new_email, &origin)
+                .await
+            {
+                log::warn!("send change email alert failed: {err}");
+            }
+        }
+        Ok(None) => {}
+        Err(err) => log::warn!("smtp config invalid, skip change email notifications: {err}"),
+    }
+
     Ok(Json(json!({})))
 }
 
@@ -339,8 +357,36 @@ fn to_js_val<T: Into<JsValue>>(val: Option<T>) -> JsValue {
 }
 
 #[worker::send]
-pub async fn send_verification_email() -> String {
-    "fixed-token-to-mock".to_string()
+pub async fn send_verification_email(
+    headers: HeaderMap,
+    State(env): State<Arc<Env>>,
+    Json(payload): Json<RegisterVerificationRequest>,
+) -> Result<String, AppError> {
+    let normalized_email = payload.email.trim().to_lowercase();
+    if normalized_email.is_empty() {
+        return Err(AppError::BadRequest("Missing email".to_string()));
+    }
+
+    let db = db::get_db(&env)?;
+    ensure_signup_allowed(env.as_ref(), &db, &normalized_email).await?;
+
+    let now = Utc::now().timestamp();
+    let claims = RegisterVerificationClaims {
+        sub: normalized_email.clone(),
+        email: normalized_email.clone(),
+        name: payload.name,
+        exp: now + 3600,
+        nbf: now.saturating_sub(30),
+    };
+    let jwt_secret = env.secret("JWT_SECRET")?.to_string();
+    let token = jwt::encode_hs256(&claims, &jwt_secret)?;
+
+    if let Some(smtp) = SmtpConfig::from_env(env.as_ref())? {
+        smtp.send_register_verify_email(&normalized_email, &token, &origin_from_headers(&headers))
+            .await?;
+    }
+
+    Ok(token)
 }
 
 #[worker::send]
@@ -374,4 +420,52 @@ pub async fn verify_password(
     }
 
     Ok(Json(Value::Null))
+}
+
+async fn ensure_signup_allowed(
+    env: &Env,
+    db: &D1Database,
+    normalized_email: &str,
+) -> Result<(), AppError> {
+    let user_count: Option<i64> = db
+        .prepare("SELECT COUNT(1) AS user_count FROM users")
+        .first(Some("user_count"))
+        .await
+        .map_err(|_| AppError::Database)?;
+    let user_count = user_count.unwrap_or(0);
+    if user_count > 0 {
+        return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
+    }
+
+    let allowed_emails = env
+        .secret("ALLOWED_EMAILS")
+        .ok()
+        .and_then(|secret| secret.as_ref().as_string())
+        .unwrap_or_default();
+    if !allowed_emails.trim().is_empty()
+        && allowed_emails
+            .split(",")
+            .map(|email| email.trim().to_lowercase())
+            .all(|email| email != normalized_email)
+    {
+        return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
+    }
+
+    Ok(())
+}
+
+fn origin_from_headers(headers: &HeaderMap) -> String {
+    let proto = headers
+        .get("x-forwarded-proto")
+        .or_else(|| headers.get("X-Forwarded-Proto"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("https");
+    let host = headers
+        .get("host")
+        .or_else(|| headers.get("Host"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("localhost");
+    format!("{proto}://{host}")
 }

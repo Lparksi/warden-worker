@@ -20,6 +20,7 @@ Warden Worker 是一个运行在 Cloudflare Workers 上的 Bitwarden 兼容服�
 - Bitwarden 客户端兼容：浏览器扩展、桌面端、安卓端，以及多数第三方客户端。
 - 核心能力：登录/同步、Cipher 增删改、文件夹、TOTP 二步验证、WebAuthn（含 PRF）。
 - 设备能力：`knowndevice`、设备列表与推送 token 管理、设备审批授权流。
+- 邮件能力：支持 SMTP 发送注册验证邮件、邮箱变更通知、新设备登录提醒，以及设备审批通知失败时的邮件兜底。
 - Send 能力：文本 Send、文件 Send、文件上传与下载。
 - 实时通知：`/notifications/hub` 与 `/notifications/anonymous-hub`（设备审批依赖）。
 
@@ -65,12 +66,28 @@ wrangler secret put JWT_SECRET
 wrangler secret put JWT_REFRESH_SECRET
 wrangler secret put ALLOWED_EMAILS
 wrangler secret put TWO_FACTOR_ENC_KEY
+wrangler secret put SMTP_HOST
+wrangler secret put SMTP_FROM
+wrangler secret put SMTP_USERNAME
+wrangler secret put SMTP_PASSWORD
 ```
 
 - `JWT_SECRET`：访问令牌签名密钥
 - `JWT_REFRESH_SECRET`：刷新令牌签名密钥
 - `ALLOWED_EMAILS`：首号注册白名单（逗号分隔）。仅在数据库尚无用户时生效。
 - `TWO_FACTOR_ENC_KEY`：可选，Base64 的 32 字节密钥，用于加密存储 TOTP 秘钥。
+- SMTP（可选，用于 `/identity/accounts/register/send-verification-email` 发送验证邮件）：
+  - `SMTP_HOST`：SMTP 主机（配置该项即启用 SMTP）
+  - `SMTP_PORT`：可选，默认 `587`（`SMTP_SECURITY=starttls`）、`465`（`force_tls`）、`25`（`off`）
+  - `SMTP_SECURITY`：可选，`starttls` / `force_tls` / `off`，默认 `starttls`
+  - `SMTP_FROM`：发件邮箱（必填）
+  - `SMTP_FROM_NAME`：可选，发件人名称，默认 `Warden Worker`
+  - `SMTP_HELO_NAME`：可选，EHLO/HELO 名称，默认 `warden-worker`
+  - `SMTP_USERNAME` + `SMTP_PASSWORD`：可选，需成对配置
+  - 邮箱 2FA 相关可选参数：
+    - `EMAIL_TOKEN_SIZE`：验证码位数，默认 `6`
+    - `EMAIL_EXPIRATION_TIME`：验证码有效期（秒），默认 `600`
+    - `EMAIL_ATTEMPTS_LIMIT`：验证码错误次数上限，默认 `3`
 
 ### 5. 配置并同步 Web Vault 前端
 
@@ -131,6 +148,7 @@ wrangler deploy
 - 配置与探测：`GET /api/config`、`GET /api/alive`、`GET /api/now`、`GET /api/version`
 - 登录与认证：`POST /identity/accounts/prelogin`、`POST /identity/connect/token`
 - 设备与审批：`GET /api/devices/knowndevice`、`GET /api/devices`、`POST /api/auth-requests`、`PUT /api/auth-requests/{id}`
+- 邮箱二步验证：`POST /api/two-factor/get-email`、`POST /api/two-factor/send-email`、`PUT /api/two-factor/email`、`POST /api/two-factor/send-email-login`
 - WebAuthn：`POST /api/webauthn/attestation-options`、`POST /api/webauthn/assertion-options`、`POST /api/webauthn`、`PUT /api/webauthn`
 - Send：`GET/POST /api/sends`、`POST /api/sends/file/v2`、`POST /api/sends/{send_id}/file/{file_id}`、`GET /api/sends/{send_id}/{file_id}`
 - 密码库：`GET /api/sync`、`POST /api/ciphers/create`、`PUT /api/ciphers/{id}`、`PUT /api/ciphers/{id}/delete`

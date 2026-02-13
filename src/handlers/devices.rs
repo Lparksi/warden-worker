@@ -14,7 +14,7 @@ use uuid::Uuid;
 use wasm_bindgen::JsValue;
 use worker::Env;
 
-use crate::{auth::Claims, db, error::AppError, notifications};
+use crate::{auth::Claims, db, error::AppError, notifications, smtp::SmtpConfig};
 
 fn to_js_val<T: Into<JsValue>>(val: Option<T>) -> JsValue {
     val.map(Into::into).unwrap_or(JsValue::NULL)
@@ -517,7 +517,7 @@ pub async fn post_auth_request(
     let email = payload.email.trim().to_lowercase();
     let user_id: Option<String> = db
         .prepare("SELECT id FROM users WHERE email = ?1")
-        .bind(&[email.into()])?
+        .bind(&[email.clone().into()])?
         .first(Some("id"))
         .await
         .map_err(|_| AppError::Database)?;
@@ -567,7 +567,7 @@ pub async fn post_auth_request(
         user_id.clone().into(),
         request_device_identifier.clone().into(),
         req_device_type.into(),
-        request_ip.into(),
+        request_ip.clone().into(),
         access_code_hash.into(),
         request_public_key.clone().into(),
         now.clone().into(),
@@ -578,6 +578,28 @@ pub async fn post_auth_request(
     if let Err(err) = notifications::publish_auth_request(env.as_ref(), &user_id, &request_id).await
     {
         log::warn!("publish auth request notify failed: {err}");
+        match SmtpConfig::from_env(env.as_ref()) {
+            Ok(Some(smtp)) => {
+                let origin = origin_from_headers(&headers);
+                if let Err(mail_err) = smtp
+                    .send_auth_request_fallback_alert(
+                        &email,
+                        &request_id,
+                        &request_device_identifier,
+                        req_device_type,
+                        &request_ip,
+                        &origin,
+                    )
+                    .await
+                {
+                    log::warn!("send auth request fallback email failed: {mail_err}");
+                }
+            }
+            Ok(None) => {}
+            Err(cfg_err) => {
+                log::warn!("smtp config invalid, skip auth request fallback email: {cfg_err}")
+            }
+        }
     }
 
     Ok(Json(json!({

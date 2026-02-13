@@ -1,6 +1,7 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose, Engine as _};
+use chrono::Utc;
 use js_sys::Date;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -10,11 +11,31 @@ use worker::D1Database;
 use crate::error::AppError;
 
 pub const TWO_FACTOR_PROVIDER_AUTHENTICATOR: i32 = 0;
+pub const TWO_FACTOR_PROVIDER_EMAIL: i32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct EmailTwoFactorState {
+    pub enabled: bool,
+    pub email: String,
+    pub last_token: Option<String>,
+    pub token_sent: Option<i64>,
+    pub attempts: i64,
+}
 
 pub fn generate_totp_secret_base32_20() -> String {
     let mut bytes = [0u8; 20];
     OsRng.fill_bytes(&mut bytes);
     Secret::Raw(bytes.to_vec()).to_encoded().to_string()
+}
+
+pub fn generate_email_token(token_size: usize) -> String {
+    let size = token_size.clamp(6, 16);
+    let mut out = String::with_capacity(size);
+    for _ in 0..size {
+        let n = (OsRng.next_u32() % 10) as u8;
+        out.push((b'0' + n) as char);
+    }
+    out
 }
 
 pub async fn ensure_two_factor_authenticator_table(db: &D1Database) -> Result<(), AppError> {
@@ -23,6 +44,26 @@ pub async fn ensure_two_factor_authenticator_table(db: &D1Database) -> Result<()
             user_id TEXT PRIMARY KEY NOT NULL,
             enabled BOOLEAN NOT NULL DEFAULT 0,
             secret_enc TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )",
+    )
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+    Ok(())
+}
+
+pub async fn ensure_two_factor_email_table(db: &D1Database) -> Result<(), AppError> {
+    db.prepare(
+        "CREATE TABLE IF NOT EXISTS two_factor_email (
+            user_id TEXT PRIMARY KEY NOT NULL,
+            enabled BOOLEAN NOT NULL DEFAULT 0,
+            email TEXT NOT NULL,
+            last_token TEXT,
+            token_sent INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -45,6 +86,17 @@ pub async fn is_authenticator_enabled(db: &D1Database, user_id: &str) -> Result<
     Ok(matches!(enabled, Some(1)))
 }
 
+pub async fn is_email_enabled(db: &D1Database, user_id: &str) -> Result<bool, AppError> {
+    ensure_two_factor_email_table(db).await?;
+    let enabled: Option<i64> = db
+        .prepare("SELECT enabled FROM two_factor_email WHERE user_id = ?1")
+        .bind(&[user_id.into()])?
+        .first(Some("enabled"))
+        .await
+        .map_err(|_| AppError::Database)?;
+    Ok(matches!(enabled, Some(1)))
+}
+
 pub async fn get_authenticator_secret_enc(
     db: &D1Database,
     user_id: &str,
@@ -57,6 +109,51 @@ pub async fn get_authenticator_secret_enc(
         .await
         .map_err(|_| AppError::Database)?;
     Ok(secret_enc)
+}
+
+pub async fn get_email_state(
+    db: &D1Database,
+    user_id: &str,
+) -> Result<Option<EmailTwoFactorState>, AppError> {
+    ensure_two_factor_email_table(db).await?;
+    let row: Option<serde_json::Value> = db
+        .prepare(
+            "SELECT enabled, email, last_token, token_sent, attempts
+             FROM two_factor_email
+             WHERE user_id = ?1",
+        )
+        .bind(&[user_id.into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let enabled = row
+        .get("enabled")
+        .and_then(|v| v.as_i64())
+        .map(|v| v == 1)
+        .unwrap_or(false);
+    let email = row
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let last_token = row
+        .get("last_token")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let token_sent = row.get("token_sent").and_then(|v| v.as_i64());
+    let attempts = row.get("attempts").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    Ok(Some(EmailTwoFactorState {
+        enabled,
+        email,
+        last_token,
+        token_sent,
+        attempts,
+    }))
 }
 
 pub async fn upsert_authenticator_secret(
@@ -85,6 +182,134 @@ pub async fn upsert_authenticator_secret(
     Ok(())
 }
 
+pub async fn upsert_email_state(
+    db: &D1Database,
+    user_id: &str,
+    enabled: bool,
+    email: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    ensure_two_factor_email_table(db).await?;
+    db.prepare(
+        "INSERT INTO two_factor_email (user_id, enabled, email, last_token, token_sent, attempts, created_at, updated_at)
+         VALUES (?1, ?2, ?3, NULL, NULL, 0, ?4, ?5)
+         ON CONFLICT(user_id) DO UPDATE SET
+           enabled = excluded.enabled,
+           email = excluded.email,
+           updated_at = excluded.updated_at",
+    )
+    .bind(&[
+        user_id.into(),
+        (if enabled { 1 } else { 0 }).into(),
+        email.into(),
+        now.into(),
+        now.into(),
+    ])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+    Ok(())
+}
+
+pub async fn set_email_token(
+    db: &D1Database,
+    user_id: &str,
+    token: &str,
+    now_rfc3339: &str,
+) -> Result<(), AppError> {
+    ensure_two_factor_email_table(db).await?;
+    let ts = Utc::now().timestamp() as f64;
+    db.prepare(
+        "UPDATE two_factor_email
+         SET last_token = ?1, token_sent = ?2, attempts = 0, updated_at = ?3
+         WHERE user_id = ?4",
+    )
+    .bind(&[token.into(), ts.into(), now_rfc3339.into(), user_id.into()])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+    Ok(())
+}
+
+pub async fn consume_email_token(
+    db: &D1Database,
+    user_id: &str,
+    token: &str,
+    expiration_secs: i64,
+    attempts_limit: i64,
+) -> Result<(), AppError> {
+    let state = get_email_state(db, user_id).await?;
+    let Some(state) = state else {
+        return Err(AppError::Unauthorized(
+            "Invalid two factor token.".to_string(),
+        ));
+    };
+    let Some(issued_token) = state.last_token.as_deref() else {
+        return Err(AppError::Unauthorized(
+            "Invalid two factor token.".to_string(),
+        ));
+    };
+    let Some(sent_ts) = state.token_sent else {
+        return Err(AppError::Unauthorized(
+            "Invalid two factor token.".to_string(),
+        ));
+    };
+
+    let now_ts = Utc::now().timestamp();
+    if now_ts > sent_ts.saturating_add(expiration_secs.max(1)) {
+        clear_email_token(db, user_id).await?;
+        return Err(AppError::Unauthorized(
+            "Invalid two factor token.".to_string(),
+        ));
+    }
+
+    if !constant_time_eq::constant_time_eq(issued_token.as_bytes(), token.as_bytes()) {
+        bump_email_attempt(db, user_id).await?;
+        let refreshed = get_email_state(db, user_id).await?;
+        if let Some(refreshed) = refreshed {
+            if refreshed.attempts >= attempts_limit.max(1) {
+                clear_email_token(db, user_id).await?;
+            }
+        }
+        return Err(AppError::Unauthorized(
+            "Invalid two factor token.".to_string(),
+        ));
+    }
+
+    clear_email_token(db, user_id).await?;
+    Ok(())
+}
+
+pub async fn clear_email_token(db: &D1Database, user_id: &str) -> Result<(), AppError> {
+    ensure_two_factor_email_table(db).await?;
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "UPDATE two_factor_email
+         SET last_token = NULL, token_sent = NULL, attempts = 0, updated_at = ?1
+         WHERE user_id = ?2",
+    )
+    .bind(&[now.into(), user_id.into()])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+    Ok(())
+}
+
+pub async fn bump_email_attempt(db: &D1Database, user_id: &str) -> Result<(), AppError> {
+    ensure_two_factor_email_table(db).await?;
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "UPDATE two_factor_email
+         SET attempts = COALESCE(attempts, 0) + 1, updated_at = ?1
+         WHERE user_id = ?2",
+    )
+    .bind(&[now.into(), user_id.into()])?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+    Ok(())
+}
+
 pub async fn disable_authenticator(db: &D1Database, user_id: &str) -> Result<(), AppError> {
     ensure_two_factor_authenticator_table(db).await?;
     db.prepare("DELETE FROM two_factor_authenticator WHERE user_id = ?1")
@@ -93,6 +318,32 @@ pub async fn disable_authenticator(db: &D1Database, user_id: &str) -> Result<(),
         .await
         .map_err(|_| AppError::Database)?;
     Ok(())
+}
+
+pub async fn disable_email(db: &D1Database, user_id: &str) -> Result<(), AppError> {
+    ensure_two_factor_email_table(db).await?;
+    db.prepare("DELETE FROM two_factor_email WHERE user_id = ?1")
+        .bind(&[user_id.into()])?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+    Ok(())
+}
+
+pub fn obscure_email(email: &str) -> String {
+    let mut parts = email.rsplitn(2, '@');
+    let domain = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if name.is_empty() || domain.is_empty() {
+        return "***".to_string();
+    }
+
+    let mut name_chars = name.chars();
+    let first = name_chars.next().unwrap_or('*');
+    let second = name_chars.next().unwrap_or('*');
+    let rest_len = name_chars.count();
+    let stars = if rest_len == 0 { 1 } else { rest_len };
+    format!("{first}{second}{}@{domain}", "*".repeat(stars))
 }
 
 pub fn encrypt_secret_with_optional_key(

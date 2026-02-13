@@ -10,6 +10,7 @@ use worker::Env;
 use crate::auth::Claims;
 use crate::db;
 use crate::error::AppError;
+use crate::smtp::SmtpConfig;
 use crate::two_factor;
 use crate::webauthn;
 
@@ -103,6 +104,30 @@ pub struct DisableTwoFactorProviderData {
     r#type: NumberOrString,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendEmailData {
+    email: String,
+    master_password_hash: Option<String>,
+    otp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyEmailData {
+    token: String,
+    master_password_hash: Option<String>,
+    otp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendEmailLoginData {
+    email: String,
+    #[serde(alias = "MasterPasswordHash")]
+    master_password_hash: Option<String>,
+}
+
 #[worker::send]
 pub async fn two_factor_status(
     claims: Claims,
@@ -110,11 +135,15 @@ pub async fn two_factor_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = db::get_db(&env)?;
     let authenticator_enabled = two_factor::is_authenticator_enabled(&db, &claims.sub).await?;
+    let email_enabled = two_factor::is_email_enabled(&db, &claims.sub).await?;
     let webauthn_enabled = webauthn::is_webauthn_enabled(&db, &claims.sub).await?;
-    let enabled = authenticator_enabled || webauthn_enabled;
+    let enabled = authenticator_enabled || email_enabled || webauthn_enabled;
     let mut providers: Vec<i32> = Vec::new();
     if authenticator_enabled {
         providers.push(two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR);
+    }
+    if email_enabled {
+        providers.push(two_factor::TWO_FACTOR_PROVIDER_EMAIL);
     }
     if webauthn_enabled {
         providers.push(webauthn::TWO_FACTOR_PROVIDER_WEBAUTHN);
@@ -209,6 +238,179 @@ pub async fn get_authenticator(
         "key": key,
         "object": "twoFactorAuthenticator"
     })))
+}
+
+#[worker::send]
+pub async fn get_email(
+    claims: Claims,
+    State(env): State<Arc<Env>>,
+    Json(payload): Json<PasswordOrOtpData>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = db::get_db(&env)?;
+    payload.validate(&db, &claims.sub).await?;
+
+    let state = two_factor::get_email_state(&db, &claims.sub).await?;
+    let (enabled, email) = match state {
+        Some(s) if s.enabled => (true, json!(s.email)),
+        _ => (false, serde_json::Value::Null),
+    };
+
+    Ok(Json(json!({
+        "email": email,
+        "enabled": enabled,
+        "object": "twoFactorEmail"
+    })))
+}
+
+#[worker::send]
+pub async fn send_email(
+    claims: Claims,
+    State(env): State<Arc<Env>>,
+    Json(payload): Json<SendEmailData>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = db::get_db(&env)?;
+    PasswordOrOtpData {
+        master_password_hash: payload.master_password_hash,
+        otp: payload.otp,
+    }
+    .validate(&db, &claims.sub)
+    .await?;
+
+    let email = payload.email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err(AppError::BadRequest("Missing email".to_string()));
+    }
+
+    let smtp = SmtpConfig::from_env(env.as_ref())?
+        .ok_or_else(|| AppError::BadRequest("SMTP is not configured".to_string()))?;
+    let now = Utc::now().to_rfc3339();
+    two_factor::upsert_email_state(&db, &claims.sub, false, &email, &now).await?;
+
+    let token_size = env
+        .var("EMAIL_TOKEN_SIZE")
+        .ok()
+        .and_then(|v| v.to_string().parse::<usize>().ok())
+        .unwrap_or(6);
+    let token = two_factor::generate_email_token(token_size);
+    two_factor::set_email_token(&db, &claims.sub, &token, &now).await?;
+    smtp.send_twofactor_email_token(&email, &token).await?;
+
+    Ok(Json(json!({})))
+}
+
+#[worker::send]
+pub async fn email(
+    claims: Claims,
+    State(env): State<Arc<Env>>,
+    Json(payload): Json<VerifyEmailData>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = db::get_db(&env)?;
+    PasswordOrOtpData {
+        master_password_hash: payload.master_password_hash,
+        otp: payload.otp,
+    }
+    .validate(&db, &claims.sub)
+    .await?;
+
+    let token = payload.token.trim().to_string();
+    if token.is_empty() {
+        return Err(AppError::BadRequest("Missing token".to_string()));
+    }
+
+    let expiration = env
+        .var("EMAIL_EXPIRATION_TIME")
+        .ok()
+        .and_then(|v| v.to_string().parse::<i64>().ok())
+        .unwrap_or(600);
+    let attempts_limit = env
+        .var("EMAIL_ATTEMPTS_LIMIT")
+        .ok()
+        .and_then(|v| v.to_string().parse::<i64>().ok())
+        .unwrap_or(3);
+    two_factor::consume_email_token(&db, &claims.sub, &token, expiration, attempts_limit).await?;
+
+    let state = two_factor::get_email_state(&db, &claims.sub)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Email two factor setup not found".to_string()))?;
+    let now = Utc::now().to_rfc3339();
+    two_factor::upsert_email_state(&db, &claims.sub, true, &state.email, &now).await?;
+
+    Ok(Json(json!({
+        "email": state.email,
+        "enabled": true,
+        "object": "twoFactorEmail"
+    })))
+}
+
+#[worker::send]
+pub async fn send_email_login(
+    State(env): State<Arc<Env>>,
+    Json(payload): Json<SendEmailLoginData>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = db::get_db(&env)?;
+
+    let email = payload.email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err(AppError::BadRequest("Missing email".to_string()));
+    }
+
+    let user: serde_json::Value = db
+        .prepare("SELECT id, master_password_hash FROM users WHERE email = ?1")
+        .bind(&[email.clone().into()])?
+        .first(None)
+        .await
+        .map_err(|_| {
+            AppError::Unauthorized("Username or password is incorrect. Try again.".to_string())
+        })?
+        .ok_or_else(|| {
+            AppError::Unauthorized("Username or password is incorrect. Try again.".to_string())
+        })?;
+    let user_id = user
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Internal)?
+        .to_string();
+    let stored_hash = user
+        .get("master_password_hash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Internal)?
+        .to_string();
+
+    let submitted_hash = payload
+        .master_password_hash
+        .ok_or_else(|| AppError::BadRequest("No password hash has been submitted.".to_string()))?;
+    if !constant_time_eq(stored_hash.as_bytes(), submitted_hash.as_bytes()) {
+        return Err(AppError::Unauthorized(
+            "Username or password is incorrect. Try again.".to_string(),
+        ));
+    }
+
+    let state = two_factor::get_email_state(&db, &user_id).await?;
+    let Some(state) = state else {
+        return Err(AppError::Unauthorized(
+            "Email 2FA is not enabled".to_string(),
+        ));
+    };
+    if !state.enabled {
+        return Err(AppError::Unauthorized(
+            "Email 2FA is not enabled".to_string(),
+        ));
+    }
+
+    let smtp = SmtpConfig::from_env(env.as_ref())?
+        .ok_or_else(|| AppError::BadRequest("SMTP is not configured".to_string()))?;
+    let now = Utc::now().to_rfc3339();
+    let token_size = env
+        .var("EMAIL_TOKEN_SIZE")
+        .ok()
+        .and_then(|v| v.to_string().parse::<usize>().ok())
+        .unwrap_or(6);
+    let token = two_factor::generate_email_token(token_size);
+    two_factor::set_email_token(&db, &user_id, &token, &now).await?;
+    smtp.send_twofactor_email_token(&state.email, &token)
+        .await?;
+
+    Ok(Json(json!({})))
 }
 
 #[worker::send]
@@ -398,6 +600,9 @@ pub async fn disable_two_factor(
     match provider {
         two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR => {
             two_factor::disable_authenticator(&db, &claims.sub).await?
+        }
+        two_factor::TWO_FACTOR_PROVIDER_EMAIL => {
+            two_factor::disable_email(&db, &claims.sub).await?
         }
         webauthn::TWO_FACTOR_PROVIDER_WEBAUTHN => {
             webauthn::disable_webauthn(&db, &claims.sub).await?

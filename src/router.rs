@@ -119,6 +119,13 @@ pub fn api_router(env: Env) -> Router {
             "/api/two-factor/get-authenticator",
             post(two_factor::get_authenticator),
         )
+        .route("/api/two-factor/get-email", post(two_factor::get_email))
+        .route("/api/two-factor/send-email", post(two_factor::send_email))
+        .route("/api/two-factor/email", put(two_factor::email))
+        .route(
+            "/api/two-factor/send-email-login",
+            post(two_factor::send_email_login),
+        )
         .route("/api/two-factor/get-webauthn", post(webauthn::get_webauthn))
         .route(
             "/api/two-factor/get-webauthn-challenge",

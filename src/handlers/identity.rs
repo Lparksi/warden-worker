@@ -15,7 +15,7 @@ use worker::Env;
 
 use crate::{
     auth::Claims, db, error::AppError, handlers::devices, jwt, models::user::User, notifications,
-    two_factor, webauthn,
+    smtp::SmtpConfig, two_factor, webauthn,
 };
 
 fn deserialize_trimmed_i32_opt<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
@@ -217,6 +217,31 @@ async fn ensure_device_record_exists_for_login(
     Ok(())
 }
 
+async fn was_known_device(
+    db: &worker::D1Database,
+    user_id: &str,
+    device_identifier: Option<&str>,
+) -> Result<bool, AppError> {
+    let Some(device_identifier) = device_identifier else {
+        return Ok(true);
+    };
+
+    devices::ensure_devices_table(db).await?;
+    let exists: Option<i64> = db
+        .prepare(
+            "SELECT 1 AS ok
+             FROM devices
+             WHERE user_id = ?1 AND device_identifier = ?2
+             LIMIT 1",
+        )
+        .bind(&[user_id.into(), device_identifier.into()])?
+        .first(Some("ok"))
+        .await
+        .map_err(|_| AppError::Database)?;
+
+    Ok(exists.unwrap_or(0) == 1)
+}
+
 async fn validate_auth_request_login(
     db: &worker::D1Database,
     user_id: &str,
@@ -331,6 +356,19 @@ async fn two_factor_metadata(
         );
     }
 
+    if two_factor::is_email_enabled(db, user_id).await? {
+        let email_state = two_factor::get_email_state(db, user_id).await?;
+        if let Some(email_state) = email_state {
+            providers.push(two_factor::TWO_FACTOR_PROVIDER_EMAIL.to_string());
+            providers2.insert(
+                two_factor::TWO_FACTOR_PROVIDER_EMAIL.to_string(),
+                json!({
+                    "Email": two_factor::obscure_email(&email_state.email)
+                }),
+            );
+        }
+    }
+
     if webauthn::is_webauthn_enabled(db, user_id).await? {
         let rp_id = webauthn::rp_id_from_headers(headers);
         let origin = webauthn::origin_from_headers(headers);
@@ -441,17 +479,25 @@ pub async fn token(
                 return Err(AppError::Unauthorized("Invalid credentials".to_string()));
             }
 
+            let user_id = user.id.clone();
+            let user_email = user.email.clone();
+            let device_identifier = payload.device_identifier.clone();
+            let device_name = payload.device_name.clone();
+            let device_type = payload.device_type;
+            let device_was_known =
+                was_known_device(&db, &user_id, device_identifier.as_deref()).await?;
+
             ensure_device_record_exists_for_login(
                 &db,
-                &user.id,
-                payload.device_identifier.as_deref(),
-                payload.device_name.as_deref(),
-                payload.device_type,
+                &user_id,
+                device_identifier.as_deref(),
+                device_name.as_deref(),
+                device_type,
             )
             .await?;
 
-            let authenticator_enabled = two_factor::is_authenticator_enabled(&db, &user.id).await?;
-            let webauthn_enabled = webauthn::is_webauthn_enabled(&db, &user.id).await?;
+            let authenticator_enabled = two_factor::is_authenticator_enabled(&db, &user_id).await?;
+            let webauthn_enabled = webauthn::is_webauthn_enabled(&db, &user_id).await?;
             let two_factor_enabled = authenticator_enabled || webauthn_enabled;
             let remember_device_requested = payload.two_factor_remember == Some(1);
             let mut remember_token_to_return: Option<String> = None;
@@ -460,7 +506,7 @@ pub async fn token(
                 let token = payload.two_factor_token.clone();
 
                 if provider == Some(5) {
-                    let Some(device_identifier) = payload.device_identifier.as_deref() else {
+                    let Some(device_identifier) = device_identifier.as_deref() else {
                         return two_factor_required_response(&db, &user.id, &headers).await;
                     };
                     let Some(token) = token.as_deref() else {
@@ -485,6 +531,36 @@ pub async fn token(
                     let candidate_hash = devices::sha256_hex(token);
                     if !constant_time_eq(stored_hash.as_bytes(), candidate_hash.as_bytes()) {
                         return two_factor_required_response(&db, &user.id, &headers).await;
+                    }
+                } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_EMAIL) {
+                    if !two_factor::is_email_enabled(&db, &user.id).await? {
+                        return two_factor_required_response(&db, &user.id, &headers).await;
+                    }
+                    let Some(token) = token.as_deref() else {
+                        return two_factor_required_response(&db, &user.id, &headers).await;
+                    };
+
+                    let expiration = env
+                        .var("EMAIL_EXPIRATION_TIME")
+                        .ok()
+                        .and_then(|v| v.to_string().parse::<i64>().ok())
+                        .unwrap_or(600);
+                    let attempts_limit = env
+                        .var("EMAIL_ATTEMPTS_LIMIT")
+                        .ok()
+                        .and_then(|v| v.to_string().parse::<i64>().ok())
+                        .unwrap_or(3);
+                    if two_factor::consume_email_token(
+                        &db,
+                        &user.id,
+                        token,
+                        expiration,
+                        attempts_limit,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return invalid_two_factor_response(&db, &user.id, &headers).await;
                     }
                 } else if provider == Some(two_factor::TWO_FACTOR_PROVIDER_AUTHENTICATOR) {
                     if !authenticator_enabled {
@@ -529,11 +605,6 @@ pub async fn token(
                     remember_token_to_return = Some(generate_remember_token());
                 }
             }
-
-            let user_id = user.id.clone();
-            let device_identifier = payload.device_identifier.clone();
-            let device_name = payload.device_name.clone();
-            let device_type = payload.device_type;
 
             let mut response =
                 generate_tokens_and_response(user, &env, device_identifier.as_deref(), None)?;
@@ -607,6 +678,36 @@ pub async fn token(
             )
             .await;
 
+            if !device_was_known {
+                if let Some(device_identifier) = device_identifier.as_deref() {
+                    let login_ip = devices::client_ip_from_headers(&headers);
+                    let login_origin = devices::origin_from_headers(&headers);
+                    let login_device_type = device_type
+                        .unwrap_or_else(|| devices::client_device_type_from_headers(&headers));
+                    match SmtpConfig::from_env(env.as_ref()) {
+                        Ok(Some(smtp)) => {
+                            if let Err(err) = smtp
+                                .send_new_device_login_alert(
+                                    &user_email,
+                                    device_identifier,
+                                    device_name.as_deref(),
+                                    login_device_type,
+                                    &login_ip,
+                                    &login_origin,
+                                )
+                                .await
+                            {
+                                log::warn!("send new device login alert failed: {err}");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            log::warn!("smtp config invalid, skip new device alert: {err}")
+                        }
+                    }
+                }
+            }
+
             Ok(Json(response).into_response())
         }
         "webauthn" => {
@@ -635,10 +736,13 @@ pub async fn token(
                 .map_err(|_| AppError::Unauthorized("Invalid credentials".to_string()))?
                 .ok_or_else(|| AppError::Unauthorized("Invalid credentials".to_string()))?;
             let user: User = serde_json::from_value(user).map_err(|_| AppError::Internal)?;
+            let user_email = user.email.clone();
 
             let device_identifier = payload.device_identifier.clone();
             let device_name = payload.device_name.clone();
             let device_type = payload.device_type;
+            let device_was_known =
+                was_known_device(&db, &user_id, device_identifier.as_deref()).await?;
 
             let webauthn_prf_option = match (
                 login_result.encrypted_private_key.as_deref(),
@@ -700,6 +804,36 @@ pub async fn token(
                 device_identifier.as_deref(),
             )
             .await;
+
+            if !device_was_known {
+                if let Some(device_identifier) = device_identifier.as_deref() {
+                    let login_ip = devices::client_ip_from_headers(&headers);
+                    let login_origin = devices::origin_from_headers(&headers);
+                    let login_device_type = device_type
+                        .unwrap_or_else(|| devices::client_device_type_from_headers(&headers));
+                    match SmtpConfig::from_env(env.as_ref()) {
+                        Ok(Some(smtp)) => {
+                            if let Err(err) = smtp
+                                .send_new_device_login_alert(
+                                    &user_email,
+                                    device_identifier,
+                                    device_name.as_deref(),
+                                    login_device_type,
+                                    &login_ip,
+                                    &login_origin,
+                                )
+                                .await
+                            {
+                                log::warn!("send new device login alert failed: {err}");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            log::warn!("smtp config invalid, skip new device alert: {err}")
+                        }
+                    }
+                }
+            }
 
             Ok(Json(response).into_response())
         }
