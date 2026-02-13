@@ -132,20 +132,22 @@ pub async fn register(
         .await
         .map_err(|_| AppError::Database)?;
     let user_count = user_count.unwrap_or(0);
-    if user_count == 0 {
-        let allowed_emails = env
-            .secret("ALLOWED_EMAILS")
-            .ok()
-            .and_then(|secret| secret.as_ref().as_string())
-            .unwrap_or_default();
-        if !allowed_emails.trim().is_empty()
-            && allowed_emails
-                .split(",")
-                .map(|email| email.trim().to_lowercase())
-                .all(|email| email != normalized_email)
-        {
-            return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
-        }
+    if user_count > 0 {
+        return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
+    }
+
+    let allowed_emails = env
+        .secret("ALLOWED_EMAILS")
+        .ok()
+        .and_then(|secret| secret.as_ref().as_string())
+        .unwrap_or_default();
+    if !allowed_emails.trim().is_empty()
+        && allowed_emails
+            .split(",")
+            .map(|email| email.trim().to_lowercase())
+            .all(|email| email != normalized_email)
+    {
+        return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
     }
     let now = Utc::now().to_rfc3339();
     let user = User {
