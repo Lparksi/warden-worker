@@ -231,7 +231,7 @@ impl NotificationsHub {
     fn broadcast_to_tag(&self, tag: &str, payload: &[u8]) {
         for ws in self.state.get_websockets_with_tag(tag) {
             if let Err(err) = ws.send_with_bytes(payload) {
-                log::warn!("notifications send failed ({tag}): {err}");
+                log::warn!("notifications send failed: {err}");
             }
         }
     }
@@ -239,7 +239,7 @@ impl NotificationsHub {
     fn close_tagged_websockets(&self, tag: &str, reason: &str) {
         for ws in self.state.get_websockets_with_tag(tag) {
             if let Err(err) = ws.close(Some(1000), Some(reason)) {
-                log::warn!("notifications close failed ({tag}): {err}");
+                log::warn!("notifications close failed: {err}");
             }
         }
     }

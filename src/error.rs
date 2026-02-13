@@ -31,8 +31,8 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {
-            AppError::Worker(e) => {
-                log::error!("Worker error: {}", e);
+            AppError::Worker(_e) => {
+                log::error!("Worker error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal server error".to_string(),

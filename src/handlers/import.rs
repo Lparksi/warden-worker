@@ -36,13 +36,17 @@ pub async fn import_data(
             updated_at: now.clone(),
         };
 
-        folder_stmts.push(db.prepare(folder_query).bind(&[
-            folder.id.into(),
-            folder.user_id.into(),
-            folder.name.into(),
-            folder.created_at.into(),
-            folder.updated_at.into(),
-        ])?);
+        folder_stmts.push(
+            db.prepare(folder_query)
+                .bind(&[
+                    folder.id.into(),
+                    folder.user_id.into(),
+                    folder.name.into(),
+                    folder.created_at.into(),
+                    folder.updated_at.into(),
+                ])
+                .map_err(|_| AppError::Database)?,
+        );
 
         if folder_stmts.len() >= IMPORT_BATCH_SIZE {
             run_batch(&db, &mut folder_stmts).await?;
@@ -84,17 +88,21 @@ pub async fn import_data(
         let user_id = claims.sub.clone();
         let data = serde_json::to_string(&cipher_data).map_err(|_| AppError::Internal)?;
 
-        cipher_stmts.push(db.prepare(cipher_query).bind(&[
-            id.into(),
-            user_id.into(),
-            to_js_val(import_cipher.organization_id),
-            import_cipher.r#type.into(),
-            data.into(),
-            import_cipher.favorite.into(),
-            to_js_val(import_cipher.folder_id),
-            now.clone().into(),
-            now.clone().into(),
-        ])?);
+        cipher_stmts.push(
+            db.prepare(cipher_query)
+                .bind(&[
+                    id.into(),
+                    user_id.into(),
+                    to_js_val(import_cipher.organization_id),
+                    import_cipher.r#type.into(),
+                    data.into(),
+                    import_cipher.favorite.into(),
+                    to_js_val(import_cipher.folder_id),
+                    now.clone().into(),
+                    now.clone().into(),
+                ])
+                .map_err(|_| AppError::Database)?,
+        );
 
         if cipher_stmts.len() >= IMPORT_BATCH_SIZE {
             run_batch(&db, &mut cipher_stmts).await?;

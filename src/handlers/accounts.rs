@@ -253,7 +253,8 @@ pub async fn change_master_password(
         security_stamp.into(),
         now.into(),
         claims.sub.into(),
-    ])?
+    ])
+    .map_err(|_| AppError::Database)?
     .run()
     .await
     .map_err(|_| AppError::Database)?;
@@ -318,7 +319,8 @@ pub async fn change_email(
         security_stamp.into(),
         now.into(),
         claims.sub.into(),
-    ])?
+    ])
+    .map_err(|_| AppError::Database)?
     .run()
     .await
     .map_err(|e| {

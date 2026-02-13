@@ -726,7 +726,8 @@ pub async fn put_auth_request(
             now.clone().into(),
             auth_request_id.clone().into(),
             user_id.clone().into(),
-        ])?
+        ])
+        .map_err(|_| AppError::Database)?
         .run()
         .await
         .map_err(|_| AppError::Database)?;
