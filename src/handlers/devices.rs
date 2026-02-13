@@ -721,7 +721,7 @@ pub async fn put_auth_request(
         )
         .bind(&[
             payload.key.into(),
-            master_password_hash.into(),
+            master_password_hash,
             response_device_identifier.into(),
             now.clone().into(),
             auth_request_id.clone().into(),

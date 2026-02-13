@@ -44,7 +44,9 @@ pub struct TokenRequest {
     token: Option<String>,
     #[serde(rename = "deviceResponse")]
     device_response: Option<String>,
+    #[allow(dead_code)]
     scope: Option<String>,
+    #[allow(dead_code)]
     client_id: Option<String>,
     #[serde(rename = "deviceIdentifier")]
     device_identifier: Option<String>,
@@ -205,8 +207,8 @@ async fn ensure_device_record_exists_for_login(
             Uuid::new_v4().to_string().into(),
             user_id.to_string().into(),
             device_identifier.to_string().into(),
-            device_name_value.into(),
-            device_type_value.into(),
+            device_name_value,
+            device_type_value,
             now.clone().into(),
             now.into(),
         ])
@@ -632,9 +634,9 @@ pub async fn token(
                         Uuid::new_v4().to_string().into(),
                         user_id.clone().into(),
                         device_identifier.into(),
-                        device_name_value.into(),
-                        device_type_value.into(),
-                        remember_hash_value.into(),
+                        device_name_value,
+                        device_type_value,
+                        remember_hash_value,
                         now.clone().into(),
                         now.into(),
                     ])
@@ -787,9 +789,9 @@ pub async fn token(
                         Uuid::new_v4().to_string().into(),
                         user_id.clone().into(),
                         device_identifier.into(),
-                        device_name_value.into(),
-                        device_type_value.into(),
-                        JsValue::NULL.into(),
+                        device_name_value,
+                        device_type_value,
+                        JsValue::NULL,
                         now.clone().into(),
                         now.into(),
                     ])

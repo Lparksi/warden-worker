@@ -126,6 +126,7 @@ pub struct SendData {
     pub file: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_trimmed_i64_opt")]
     pub file_length: Option<i64>,
+    #[allow(dead_code)]
     pub id: Option<String>,
 }
 

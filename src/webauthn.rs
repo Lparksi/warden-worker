@@ -61,6 +61,7 @@ struct StoredCredentialRow {
     credential_id_b64url: String,
     public_key_cose_b64: String,
     sign_count: i64,
+    #[allow(dead_code)]
     name: Option<String>,
 }
 
@@ -396,9 +397,9 @@ pub async fn update_webauthn_prf_by_slot(
     )
     .bind(&[
         f64::from(prf_status).into(),
-        opt_str_to_js_value(encrypted_public_key).into(),
-        opt_str_to_js_value(encrypted_user_key).into(),
-        opt_str_to_js_value(encrypted_private_key).into(),
+        opt_str_to_js_value(encrypted_public_key),
+        opt_str_to_js_value(encrypted_user_key),
+        opt_str_to_js_value(encrypted_private_key),
         Utc::now().to_rfc3339().into(),
         user_id.into(),
         f64::from(slot_id).into(),
@@ -445,9 +446,9 @@ pub async fn update_webauthn_prf_by_credential_id(
     )
     .bind(&[
         f64::from(prf_status).into(),
-        opt_str_to_js_value(encrypted_public_key).into(),
-        opt_str_to_js_value(encrypted_user_key).into(),
-        opt_str_to_js_value(encrypted_private_key).into(),
+        opt_str_to_js_value(encrypted_public_key),
+        opt_str_to_js_value(encrypted_user_key),
+        opt_str_to_js_value(encrypted_private_key),
         Utc::now().to_rfc3339().into(),
         user_id.into(),
         credential_id_b64url.into(),
@@ -994,29 +995,6 @@ fn strip_default_port(authority: &str, scheme: &str) -> String {
     authority
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{normalize_origin, normalize_rp_id, verify_origin};
-
-    #[test]
-    fn normalize_origin_strips_default_https_port() {
-        let normalized = normalize_origin("https://example.com:443").expect("normalized");
-        assert_eq!(normalized, "https://example.com");
-    }
-
-    #[test]
-    fn verify_origin_accepts_default_port_equivalence() {
-        assert!(verify_origin("https://example.com:443", "https://example.com").is_ok());
-        assert!(verify_origin("http://example.com:80", "http://example.com/").is_ok());
-    }
-
-    #[test]
-    fn normalize_rp_id_strips_port() {
-        assert_eq!(normalize_rp_id("example.com:443"), "example.com");
-        assert_eq!(normalize_rp_id("[::1]:8443"), "::1");
-    }
-}
-
 fn verify_rp_id_hash(rp_id: &str, rp_id_hash: &[u8; 32]) -> Result<(), AppError> {
     let expected = Sha256::digest(rp_id.as_bytes());
     if expected.as_slice() == rp_id_hash {
@@ -1038,7 +1016,7 @@ fn decode_b64_any(input: &str) -> Result<Vec<u8>, AppError> {
         return Ok(v);
     }
     let mut padded = s.to_string();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
     if let Ok(v) = general_purpose::URL_SAFE.decode(&padded) {
@@ -1053,7 +1031,9 @@ fn encode_b64url(bytes: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn parse_attestation_object(bytes: &[u8]) -> Result<([u8; 32], u32, Vec<u8>, Vec<u8>), AppError> {
+type ParsedAttestationObject = ([u8; 32], u32, Vec<u8>, Vec<u8>);
+
+fn parse_attestation_object(bytes: &[u8]) -> Result<ParsedAttestationObject, AppError> {
     let value: CborValue = ciborium::de::from_reader(Cursor::new(bytes))
         .map_err(|_| AppError::BadRequest("Invalid WebAuthn attestation".to_string()))?;
     let map = value
@@ -1187,12 +1167,12 @@ fn map_get_text<'a>(map: &'a [(CborValue, CborValue)], key: &str) -> Option<&'a 
 fn map_get_i128(map: &[(CborValue, CborValue)], key: i128) -> Option<i128> {
     map.iter().find_map(|(k, v)| {
         let k = match k {
-            CborValue::Integer(i) => i128::try_from(*i).ok(),
+            CborValue::Integer(i) => Some(i128::from(*i)),
             _ => None,
         }?;
         if k == key {
             match v {
-                CborValue::Integer(i) => i128::try_from(*i).ok(),
+                CborValue::Integer(i) => Some(i128::from(*i)),
                 _ => None,
             }
         } else {
@@ -1201,10 +1181,10 @@ fn map_get_i128(map: &[(CborValue, CborValue)], key: i128) -> Option<i128> {
     })
 }
 
-fn map_get_bytes<'a>(map: &'a [(CborValue, CborValue)], key: i128) -> Option<&'a [u8]> {
+fn map_get_bytes(map: &[(CborValue, CborValue)], key: i128) -> Option<&[u8]> {
     map.iter().find_map(|(k, v)| {
         let k = match k {
-            CborValue::Integer(i) => i128::try_from(*i).ok(),
+            CborValue::Integer(i) => Some(i128::from(*i)),
             _ => None,
         }?;
         if k == key {
@@ -1405,9 +1385,9 @@ async fn upsert_credential(
         public_key_cose_b64.into(),
         (sign_count as f64).into(),
         f64::from(WEBAUTHN_PRF_STATUS_UNSUPPORTED).into(),
-        JsValue::NULL.into(),
-        JsValue::NULL.into(),
-        JsValue::NULL.into(),
+        JsValue::NULL,
+        JsValue::NULL,
+        JsValue::NULL,
         now.clone().into(),
         now.into(),
     ])?
@@ -1528,4 +1508,27 @@ fn is_expired(expires_at: &str) -> Result<bool, AppError> {
         .map_err(|_| AppError::Database)?
         .with_timezone(&Utc);
     Ok(Utc::now() >= expires)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_origin, normalize_rp_id, verify_origin};
+
+    #[test]
+    fn normalize_origin_strips_default_https_port() {
+        let normalized = normalize_origin("https://example.com:443").expect("normalized");
+        assert_eq!(normalized, "https://example.com");
+    }
+
+    #[test]
+    fn verify_origin_accepts_default_port_equivalence() {
+        assert!(verify_origin("https://example.com:443", "https://example.com").is_ok());
+        assert!(verify_origin("http://example.com:80", "http://example.com/").is_ok());
+    }
+
+    #[test]
+    fn normalize_rp_id_strips_port() {
+        assert_eq!(normalize_rp_id("example.com:443"), "example.com");
+        assert_eq!(normalize_rp_id("[::1]:8443"), "::1");
+    }
 }
