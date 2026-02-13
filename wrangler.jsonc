@@ -40,7 +40,7 @@
 
   // 构建配置（等价于 [build]）
   "build": {
-    "command": "worker-build --release"
+    "command": "node ./scripts/sync-web-vault.mjs && worker-build --release"
   },
 
   "assets": {

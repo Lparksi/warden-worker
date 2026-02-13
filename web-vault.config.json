@@ -1,0 +1,8 @@
+{
+  "releaseRepo": "dani-garcia/bw_web_builds",
+  "tag": "v2026.1.1",
+  "assetPattern": "bw_web_v*.tar.gz",
+  "sourceSubdir": ".",
+  "targetDir": "static/web-vault",
+  "keepSourceMaps": false
+}

@@ -72,7 +72,43 @@ wrangler secret put TWO_FACTOR_ENC_KEY
 - `ALLOWED_EMAILS`：首号注册白名单（逗号分隔）。仅在数据库尚无用户时生效。
 - `TWO_FACTOR_ENC_KEY`：可选，Base64 的 32 字节密钥，用于加密存储 TOTP 秘钥。
 
-### 5. 部署
+### 5. 配置并同步 Web Vault 前端
+
+项目默认不再手动维护固定前端文件，而是按 `web-vault.config.json` 自动下载并解压
+`dani-garcia/bw_web_builds` 指定 tag 的 release `.tar.gz`（默认 `v2026.1.1`）。
+`static/web-vault` 已加入 `.gitignore`，不再入库，统一由同步脚本生成。
+默认会移除 `*.map` sourcemap（避免 Cloudflare Workers 单文件 25 MiB 限制）。
+
+```bash
+node ./scripts/sync-web-vault.mjs
+```
+
+可选覆盖（临时切版本，不改配置文件）：
+
+```bash
+BW_WEB_BUILDS_TAG=v2026.1.1 node ./scripts/sync-web-vault.mjs
+```
+
+```powershell
+$env:BW_WEB_BUILDS_TAG='v2026.1.1'
+node .\scripts\sync-web-vault.mjs
+```
+
+可选覆盖 release 仓库与资产匹配（一般无需修改）：
+
+```bash
+BW_WEB_BUILDS_RELEASE_REPO=dani-garcia/bw_web_builds \
+BW_WEB_BUILDS_ASSET_PATTERN='bw_web_v*.tar.gz' \
+node ./scripts/sync-web-vault.mjs
+```
+
+如需保留 sourcemap（不推荐用于 Workers assets）：
+
+```bash
+BW_WEB_BUILDS_KEEP_SOURCEMAPS=true node ./scripts/sync-web-vault.mjs
+```
+
+### 6. 部署
 
 ```bash
 wrangler deploy
@@ -109,6 +145,7 @@ wrangler deploy
 
 - D1 参数绑定禁止传 `undefined`。可选字段在 `.bind(&[...])` 时必须显式转 `null`（如 `JsValue::NULL` 或统一 `to_js_val(Option<T>)`）。
 - 多端协议兼容尽量按 Vaultwarden/Bitwarden 行为对齐，尤其是认证、设备审批、通知与 WebAuthn 相关接口。
+- `wrangler.jsonc` 的 build 阶段会自动执行 `node ./scripts/sync-web-vault.mjs`，按配置同步前端版本。
 
 ## 本地开发
 
