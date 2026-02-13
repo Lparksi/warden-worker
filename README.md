@@ -1,20 +1,27 @@
 # Warden Worker
 
-# 有问题？尝试 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/afoim/warden-worker)
+# 有问题？尝试 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Lparksi/warden-worker)
 
-Warden Worker 是一个运行在 Cloudflare Workers 上的轻量级 Bitwarden 兼容服务端实现，使用 Cloudflare D1（SQLite）作为数据存储，核心代码用 Rust 编写，目标是“个人/家庭可用、部署成本低、无需维护服务器”。
+Warden Worker 是一个运行在 Cloudflare Workers 上的 Bitwarden 兼容服务端实现，使用 Cloudflare D1（SQLite）存储，核心代码为 Rust + WebAssembly，目标是“个人/家庭可用、低成本、免运维”。
 
-本项目不接触你的明文密码：Bitwarden 系列客户端会在本地完成加密，服务端只保存密文数据。
+项目遵循零知识模型：客户端本地完成加密，服务端仅保存密文。
 
-> [!WARNING]
-> 如果你曾经部署过旧版本并准备升级，建议在客户端导出密码库 → 重新部署本项目（全新初始化数据库）→ 再导入密码库（可显著降低迁移/兼容成本）。
+## 最近更新
 
-## 功能
+- `2026-02-13`：首个账号注册完成后，后续注册默认关闭（`feat(accounts)`）。
+- `2026-02-13`：新增设备管理与设备审批流（`/api/auth-requests*`），支持已登录设备审批新设备登录（`feat(device manager)`）。
+- `2026-02-13`：新增/完善 WebAuthn（通行密钥）注册、断言、无主密码登录、PRF 密钥材料上送与存储（`feat(webauthn)` + `fix(security)`）。
+- `2026-02-11`：新增 Send（文本/文件）能力，文件支持分片存储（`send_file_chunks`）与下载。
+- `2026-02-11`：新增 D1 占用统计接口 `GET /api/d1/usage`。
 
-- 无服务器部署：Cloudflare Workers + D1
-- 兼容多端：官方 Bitwarden（浏览器扩展 / 桌面 / 安卓）与多数第三方客户端
-- 核心能力：注册/登录、同步、密码项（Cipher）增删改、文件夹、TOTP（Authenticator）二步验证
-- 官方安卓兼容：支持 `/api/devices/knowndevice` 与 remember-device（twoFactorProvider=5）流程
+## 功能概览
+
+- 无服务器部署：Cloudflare Workers + D1。
+- Bitwarden 客户端兼容：浏览器扩展、桌面端、安卓端，以及多数第三方客户端。
+- 核心能力：登录/同步、Cipher 增删改、文件夹、TOTP 二步验证、WebAuthn（含 PRF）。
+- 设备能力：`knowndevice`、设备列表与推送 token 管理、设备审批授权流。
+- Send 能力：文本 Send、文件 Send、文件上传与下载。
+- 实时通知：`/notifications/hub` 与 `/notifications/anonymous-hub`（设备审批依赖）。
 
 ## 快速部署（Cloudflare）
 
@@ -22,8 +29,8 @@ Warden Worker 是一个运行在 Cloudflare Workers 上的轻量级 Bitwarden �
 
 - Cloudflare 账号
 - Node.js + Wrangler：`npm i -g wrangler`
-- Rust 工具链（建议稳定版）
-- 安装 worker-build：`cargo install worker-build`
+- Rust 稳定版工具链
+- `worker-build`：`cargo install worker-build`
 
 ### 1. 创建 D1 数据库
 
@@ -31,19 +38,27 @@ Warden Worker 是一个运行在 Cloudflare Workers 上的轻量级 Bitwarden �
 wrangler d1 create vault1
 ```
 
-把输出的 `database_id` 写入 `wrangler.jsonc` 的 `d1_databases`。
+将返回的 `database_id` 写入 `wrangler.jsonc` 的 `d1_databases`。
 
-### 2. 初始化数据库
+### 2. 全新初始化数据库
 
-注意：`sql/schema_full.sql` 会 `DROP TABLE`，仅用于全新部署（会清空数据）。
+`sql/schema_full.sql` 会 `DROP TABLE`，仅适用于全新部署。
 
 ```bash
 wrangler d1 execute vault1 --remote --file=sql/schema_full.sql
 ```
 
-`sql/schema.sql` 仅保留为历史/兼容用途；推荐新部署直接使用 `sql/schema_full.sql`。
+### 3. 已有实例升级（保留数据）
 
-### 3. 配置密钥（Secrets）
+按文件名顺序执行 `sql/migrations/*.sql`。
+
+```powershell
+Get-ChildItem sql/migrations/*.sql | Sort-Object Name | ForEach-Object {
+  wrangler d1 execute vault1 --remote --file=$_.FullName
+}
+```
+
+### 4. 配置 Secrets
 
 ```bash
 wrangler secret put JWT_SECRET
@@ -52,33 +67,48 @@ wrangler secret put ALLOWED_EMAILS
 wrangler secret put TWO_FACTOR_ENC_KEY
 ```
 
-- JWT_SECRET：访问令牌签名密钥
-- JWT_REFRESH_SECRET：刷新令牌签名密钥
-- ALLOWED_EMAILS：首个账号注册白名单（仅在“数据库还没有任何用户”时启用），多个邮箱用英文逗号分隔
-- TWO_FACTOR_ENC_KEY：可选，Base64 的 32 字节密钥；用于加密存储 TOTP 秘钥（不设置则以 `plain:` 形式存储）
+- `JWT_SECRET`：访问令牌签名密钥
+- `JWT_REFRESH_SECRET`：刷新令牌签名密钥
+- `ALLOWED_EMAILS`：首号注册白名单（逗号分隔）。仅在数据库尚无用户时生效。
+- `TWO_FACTOR_ENC_KEY`：可选，Base64 的 32 字节密钥，用于加密存储 TOTP 秘钥。
 
-### 4. 部署
+### 5. 部署
 
 ```bash
 wrangler deploy
 ```
 
-部署后，把 Workers URL 或自定义域名（例如 `https://warden.2x.nz`）填入 Bitwarden 客户端的“自托管服务器 URL”。
+部署后，将 Workers URL 或自定义域名填入 Bitwarden 客户端的“自托管服务器 URL”。
+
+## 与 Bitwarden 客户端兼容的关键要求
+
+- `GET /api/config` 返回的 `environment.notifications` 必须对应可用的 WebSocket 端点：
+  `/notifications/hub` 与 `/notifications/anonymous-hub`。
+- 通知端点需兼容最小 SignalR messagepack 握手：
+  客户端发 `{"protocol":"messagepack","version":1}\x1e`，服务端回 `{}\x1e`。
+- 匿名审批连接的查询参数需大小写不敏感（兼容 `token` 与 `Token`）。
+- `wrangler.jsonc` 里 Durable Object 配置需保留：
+  `durable_objects.bindings.NOTIFICATIONS_HUB`、对应 `migrations`，以及 `assets.run_worker_first` 中的 `/notifications/*`。
+
+## 已实现的关键接口（节选）
+
+- 配置与探测：`GET /api/config`、`GET /api/alive`、`GET /api/now`、`GET /api/version`
+- 登录与认证：`POST /identity/accounts/prelogin`、`POST /identity/connect/token`
+- 设备与审批：`GET /api/devices/knowndevice`、`GET /api/devices`、`POST /api/auth-requests`、`PUT /api/auth-requests/{id}`
+- WebAuthn：`POST /api/webauthn/attestation-options`、`POST /api/webauthn/assertion-options`、`POST /api/webauthn`、`PUT /api/webauthn`
+- Send：`GET/POST /api/sends`、`POST /api/sends/file/v2`、`POST /api/sends/{send_id}/file/{file_id}`、`GET /api/sends/{send_id}/{file_id}`
+- 密码库：`GET /api/sync`、`POST /api/ciphers/create`、`PUT /api/ciphers/{id}`、`PUT /api/ciphers/{id}/delete`
+- D1 占用统计：`GET /api/d1/usage`
 
 ## 客户端使用建议
 
-- 官方安卓如果之前指向过其它自托管地址，建议“删除账号/清缓存后重新添加服务器”，避免 remember token 跨服务端复用导致登录失败。
-- 首次启用 TOTP 后，建议在同一台设备上完成一次“输入 TOTP 登录”，后续官方安卓会自动走 remember-device（provider=5）。
+- 安卓端若曾连接过其他自托管实例，建议移除账号后重新添加服务器，避免旧 remember token 干扰。
+- 设备审批依赖通知通道；若通知未连通，可能出现“审批后页面不自动跳转/需手动刷新”。
 
-## 已实现的关键接口（部分）
+## 开发注意事项
 
-- 配置与探测：`GET /api/config`、`GET /api/alive`、`GET /api/now`、`GET /api/version`
-- 登录：`POST /identity/accounts/prelogin`、`POST /identity/connect/token`
-- 同步：`GET /api/sync`
-- 密码项：`POST /api/ciphers/create`、`PUT /api/ciphers/{id}`、`PUT /api/ciphers/{id}/delete`
-- 文件夹：`POST /api/folders`、`PUT /api/folders/{id}`、`DELETE /api/folders/{id}`
-- 2FA：`GET /api/two-factor`、`/api/two-factor/authenticator/*`
-- 官方安卓设备探测：`GET /api/devices/knowndevice`
+- D1 参数绑定禁止传 `undefined`。可选字段在 `.bind(&[...])` 时必须显式转 `null`（如 `JsValue::NULL` 或统一 `to_js_val(Option<T>)`）。
+- 多端协议兼容尽量按 Vaultwarden/Bitwarden 行为对齐，尤其是认证、设备审批、通知与 WebAuthn 相关接口。
 
 ## 本地开发
 
@@ -87,7 +117,7 @@ wrangler d1 execute vault1 --local --file=sql/schema_full.sql
 wrangler dev
 ```
 
-本地可用 `.dev.vars`（Wrangler 支持）注入 secrets。
+本地可用 `.dev.vars` 注入 secrets。
 
 ## 许可证
 

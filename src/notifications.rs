@@ -1,5 +1,6 @@
 use constant_time_eq::constant_time_eq;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use wasm_bindgen::JsValue;
 use worker::{
     durable_object, DurableObject, Env, Error, Headers, Method, Request, RequestInit, Response,
@@ -14,6 +15,8 @@ const INTERNAL_AUTH_HEADER: &str = "x-internal-notify";
 
 const RECORD_SEPARATOR: u8 = 0x1e;
 const INITIAL_RESPONSE: [u8; 3] = [0x7b, 0x7d, RECORD_SEPARATOR];
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const SIGNALR_PING_FRAME: [u8; 3] = [0x02, 0x91, 0x06];
 
 const UPDATE_TYPE_AUTH_REQUEST: i32 = 15;
 const UPDATE_TYPE_AUTH_REQUEST_RESPONSE: i32 = 16;
@@ -51,7 +54,7 @@ struct CloseAnonymousPayload {
     token: String,
 }
 
-#[durable_object(websocket)]
+#[durable_object]
 pub struct NotificationsHub {
     state: State,
     env: Env,
@@ -67,13 +70,13 @@ impl DurableObject for NotificationsHub {
         let path = normalize_path(&path_owned);
 
         if req.method() == Method::Get && (path == HUB_PATH || path == HUB_PATH_WITH_PREFIX) {
-            return self.handle_user_hub(&req);
+            return self.handle_user_hub(&req).await;
         }
 
         if req.method() == Method::Get
             && (path == ANONYMOUS_HUB_PATH || path == ANONYMOUS_HUB_PATH_WITH_PREFIX)
         {
-            return self.handle_anonymous_hub(&req);
+            return self.handle_anonymous_hub(&req).await;
         }
 
         if req.method() == Method::Post && path == INTERNAL_AUTH_REQUEST_PATH {
@@ -113,6 +116,16 @@ impl DurableObject for NotificationsHub {
         Ok(())
     }
 
+    async fn alarm(&self) -> Result<Response> {
+        for ws in self.state.get_websockets() {
+            if let Err(err) = ws.send_with_bytes(SIGNALR_PING_FRAME) {
+                log::warn!("notifications ping failed: {err}");
+            }
+        }
+        self.ensure_heartbeat_alarm().await?;
+        Response::empty().map(|resp| resp.with_status(204))
+    }
+
     async fn websocket_close(
         &self,
         _ws: WebSocket,
@@ -120,6 +133,7 @@ impl DurableObject for NotificationsHub {
         _reason: String,
         _was_clean: bool,
     ) -> Result<()> {
+        self.ensure_heartbeat_alarm().await?;
         Ok(())
     }
 
@@ -130,7 +144,7 @@ impl DurableObject for NotificationsHub {
 }
 
 impl NotificationsHub {
-    fn handle_user_hub(&self, req: &Request) -> Result<Response> {
+    async fn handle_user_hub(&self, req: &Request) -> Result<Response> {
         let access_token = extract_access_token(req)
             .ok_or_else(|| Error::RustError("Missing access token".to_string()))?;
         let jwt_secret = self.env.secret("JWT_SECRET")?.to_string();
@@ -139,23 +153,34 @@ impl NotificationsHub {
 
         let tag = user_tag(&claims.sub);
         let tags = [tag.as_str()];
-        self.accept_with_tags(&tags)
+        self.accept_with_tags(&tags).await
     }
 
-    fn handle_anonymous_hub(&self, req: &Request) -> Result<Response> {
+    async fn handle_anonymous_hub(&self, req: &Request) -> Result<Response> {
         let token = query_param(req, "token")
             .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| Error::RustError("Missing token".to_string()))?;
 
         let tag = anon_tag(&token);
         let tags = [tag.as_str()];
-        self.accept_with_tags(&tags)
+        self.accept_with_tags(&tags).await
     }
 
-    fn accept_with_tags(&self, tags: &[&str]) -> Result<Response> {
+    async fn accept_with_tags(&self, tags: &[&str]) -> Result<Response> {
         let pair = WebSocketPair::new()?;
         self.state.accept_websocket_with_tags(&pair.server, tags);
+        self.ensure_heartbeat_alarm().await?;
         Response::from_websocket(pair.client)
+    }
+
+    async fn ensure_heartbeat_alarm(&self) -> Result<()> {
+        let storage = self.state.storage();
+        if self.state.get_websockets().is_empty() {
+            let _ = storage.delete_alarm().await;
+            return Ok(());
+        }
+
+        storage.set_alarm(HEARTBEAT_INTERVAL).await
     }
 
     async fn handle_internal_auth_request(&self, req: &mut Request) -> Result<Response> {
